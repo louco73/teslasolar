@@ -1,3 +1,4 @@
+import sys
 import requests
 import json
 import time
@@ -37,8 +38,14 @@ def stop_charging(car):
 
 def set_amps(car, amps):
     try:
+        # 3=3, 2=3, 1=2
+        if amps==2:
+            amps = 1
         wake(car)
         car.command('CHARGING_AMPS', charging_amps=amps)
+        # Might need to issue command twice if below 5 amps    
+        if amps < 5:
+            car.command('CHARGING_AMPS', charging_amps=amps)
     except teslapy.VehicleError as e: printerror("V: ", e)
     except teslapy.HTTPError as e: printerror("H: ", e)
 
@@ -47,15 +54,20 @@ def set_amps(car, amps):
 def charging_time(start_time, end_time):
     time_now = datetime.datetime.now()
     if time_now > start_time and time_now < end_time:
-        print(timestamp(),"Time to charge.")
         return(True)
     print(timestamp(),"Not time to charge.")
     return(False)
 
 # This function could be extended to determine if the charger is plugged in or not.
 def charging_status(charge_data):
-    if charge_data['charging_state'] == "Charging":
+    status = charge_data['charging_state']
+    if status == "Charging":
         return True
+    print("Charging State: ",status)
+    if status == "Complete":
+        sys.exit("Charging complete, exiting program.")
+    elif status == "Disconnected":
+        sys.exit("Charger not connected, exiting program.")
     return False
 
 # Display charging information.
@@ -72,11 +84,11 @@ def charge_info(charge_data):
 
 # URL for the Solar API endpoint to retrieve current data using your Fronius inverter's IP.
 solar_api_url = "http://<your_fronius_inverter_IP>/solar_api/v1/GetPowerFlowRealtimeData.fcgi"
-buffer = 1750               # Power in Watts to reserve for home usage spikes.
-min_charge_rate = 3600      # Power in Watts to set as the minimum charge rate. A function of amps*volts*phases, e.g. 5*240*3 - 3600 
-min_charge_amps = 5         # Amps that correspond to the minimum charge rate. 5 amps on 3 phase in Australia.
+buffer = 1000               # Power in Watts to reserve for home usage spikes.
+min_charge_rate = 1440      # Power in Watts to set as the minimum charge rate. A function of amps*volts*phases, e.g. 5*240*3 - 3600 
+min_charge_amps = 1         # Amps that correspond to the minimum charge rate. 5 amps on 3 phase in Australia.
 max_charge_amps = 16        # Amps that correspond to the maximum charge rate. 16 amps on 3 phase in Australia.
-min_solar = 6000            # Power in Watts from solar generation before you consider to start charing the car.
+min_solar = 4000            # Power in Watts from solar generation before you consider to start charing the car.
 current_charge_amps = 0     # Used to store what number of amps the car is charging at.
 new_charge_amps = 0         # Used to calculate and store the next desired charge rate.
 volts = 720                 # Your country's voltage * the number of phases, 240 * 3 in this case.
@@ -84,6 +96,9 @@ restart_charge_time = 300   # Seconds to wait if the charging needs to be stoppe
 refresh_rate = 60           # Seconds to wait before checking for solar power changes
 charging = False            # Simply boolean to determine if the car is charging or not.
 now = datetime.datetime.now()   # Time of program start.
+charge_info_timer = now     # Used to display the charging output every charge_info_duration minutes
+charge_info_delta = datetime.timedelta(minutes=5) # Time to wait before displaying updated charging stats
+charged_check = False       # Used to determine when to increase the frequency of checking if the car is charged
 start_time = now.replace(hour=8, minute=0, second=0, microsecond=0) # Earliest time to start charging.
 end_time = now.replace(hour=16, minute=0, second=0, microsecond=0)  # Latest time to be charging.
 retry = teslapy.Retry(total=3, status_forcelist=(500,502,503,504))  # Teslapy parameters.
@@ -100,15 +115,30 @@ with teslapy.Tesla('<your_email_address_for_tesla_account>', retry=retry, timeou
     print(timestamp(),"Car is awake!")
     charge_data = car.get_vehicle_data()['charge_state']
     charge_info(charge_data)
-    
+
+
     # Check if the car is charging to set variables to ensure correct amps for avaiable power usage calculation
     if charging_status(charge_data):
         current_charge_amps = charge_data['charge_amps']
         charging = True
     else:
-        set_amps(car, 5)    # Always start the car at the lowest level of charge.
+        set_amps(car, min_charge_amps)    # Always start the car at the lowest level of charge.
         
     while charging_time(start_time, end_time)==True:
+        # Check the car status aligns with program variables and print out charging update
+        if ((datetime.datetime.now() - charge_info_timer) > charge_info_delta) or charged_check == True:
+            wake(car)
+            charge_data = car.get_vehicle_data()['charge_state']
+            charge_info(charge_data)
+            charge_info_timer = datetime.datetime.now()
+            charging = charging_status(charge_data)
+            # Update the current amps setting from the car in case it was changed from the app
+            if charging == True:
+                current_charge_amps = charge_data['charge_amps']
+            # When the car is approaching it's charge limit we need to check every minute to exit the program once charged.    
+            if charge_data['charge_limit_soc'] - charge_data['battery_level'] < 2:
+                charged_check = True
+            
         # Send a request to the Solar API endpoint to retrieve the current inverter information and load into a JSON variable.
         response = requests.get(solar_api_url)
         solar_data = json.loads(response.text)
@@ -139,21 +169,23 @@ with teslapy.Tesla('<your_email_address_for_tesla_account>', retry=retry, timeou
                 # Large solar installations may be able to provide more power than the charger allows, so reset to max amps
                 if new_charge_amps > max_charge_amps:
                     new_charge_amps = max_charge_amps
-                # Start charging at the desired amps or change the amps if already charging.
+                # To minimize grid usage on cloudy days only ramp up by 2 amps at a time.
+                elif new_charge_amps-current_charge_amps > 2:
+                    new_charge_amps = current_charge_amps + 2
+                # Start charging at the desired amps or change the amps if necessary and already charging.
                 if charging == False:
                     print(timestamp(),"Starting charging at", new_charge_amps, "amps")
                     set_amps(car, new_charge_amps)
                     current_charge_amps = new_charge_amps
                     start_charging(car)
                     charging = True
+                # During clear sky period you will have stable power, so only call the API if there is a change.
+                elif current_charge_amps != new_charge_amps:
+                    set_amps(car, new_charge_amps)
+                    print(timestamp(),"Changed charge rate from", current_charge_amps, "amps to", new_charge_amps, "amps\n")                        
+                    current_charge_amps = new_charge_amps
                 else:
-                    # During clear sky period you will have stable power, so only call the API if there is a change.
-                    if current_charge_amps != new_charge_amps:
-                        set_amps(car, new_charge_amps)
-                        print(timestamp(),"Changed charge rate from", current_charge_amps, "amps to", new_charge_amps, "amps\n")                        
-                        current_charge_amps = new_charge_amps
-                    else:
-                        print(timestamp(),"Keeping charge rate at",new_charge_amps, "amps\n")
+                    print(timestamp(),"Keeping charge rate at",new_charge_amps, "amps\n")
             # House power draw too high or not enough buffer.
             elif charging == True:
                 stop_charging(car)
